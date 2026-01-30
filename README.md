@@ -106,7 +106,7 @@ It is important to note that the inference server and client must be deployed on
 We also provide a script for image to video-action generation:
 
 ```bash
-CONFIG_NAME='robotwin_i2av' bash script/run_launch_va_server_sync.sh 
+NGPU=1 CONFIG_NAME='robotwin_i2av' bash script/run_launch_va_server_sync.sh 
 ```
 
 
