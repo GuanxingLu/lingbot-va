@@ -11,5 +11,8 @@ va_shared_cfg.param_dtype = torch.bfloat16
 va_shared_cfg.save_root = './train_out'
 
 va_shared_cfg.patch_size = (1, 2, 2)
-
 va_shared_cfg.enable_offload = True
+va_shared_cfg.num_layers = 30
+va_shared_cfg.ignore_mismatched_sizes = False
+va_shared_cfg.seed = 42
+va_shared_cfg.enable_deterministic = True

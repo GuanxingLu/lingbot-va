@@ -42,10 +42,14 @@ def load_transformer(
     transformer_path,
     torch_dtype,
     torch_device,
+    num_layers,
+    ignore_mismatched_sizes,
 ):
     model = WanTransformer3DModel.from_pretrained(
         transformer_path,
         torch_dtype=torch_dtype,
+        num_layers=num_layers,
+        ignore_mismatched_sizes=ignore_mismatched_sizes,
     )
     return model.to(torch_device)
 

@@ -13,6 +13,8 @@ def _configure_model(model, shard_fn, param_dtype, device, eval_mode=True):
         dist.barrier()
 
     if dist.is_initialized():
+        # Convert all parameters to target dtype before FSDP to avoid mixed dtype error
+        model.to(param_dtype)
         model = shard_fn(model)
     else:
         model.to(param_dtype)

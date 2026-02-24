@@ -187,6 +187,8 @@ We also provide a script for image to video-action generation:
 
 ```bash
 NGPU=1 CONFIG_NAME='robotwin_i2av' bash script/run_launch_va_server_sync.sh
+
+NGPU=1 CONFIG_NAME='franka_i2av' bash script/run_launch_va_server_sync.sh
 ```
 
 > **GPU Memory Requirements**: Approximately **18GB VRAM** for single-GPU i2av inference with offload mode enabled (VAE and text_encoder offloaded to CPU).

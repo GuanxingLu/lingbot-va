@@ -1,6 +1,7 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
 import argparse
 import os
+import random
 import sys
 import time
 from functools import partial
@@ -17,17 +18,17 @@ from tqdm import tqdm
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from configs import VA_CONFIGS
-from distributed.fsdp import shard_model
-from distributed.util import _configure_model, init_distributed
-from modules.utils import (
+from .configs import VA_CONFIGS
+from .distributed.fsdp import shard_model
+from .distributed.util import _configure_model, init_distributed
+from .modules.utils import (
     WanVAEStreamingWrapper,
     load_text_encoder,
     load_tokenizer,
     load_transformer,
     load_vae,
 )
-from utils import (
+from .utils import (
     FlowMatchScheduler,
     data_seq_to_patch,
     get_mesh_id,
@@ -36,6 +37,8 @@ from utils import (
     run_async_server_mode,
     save_async,
 )
+
+DEBUG = True
 
 
 class VA_Server:
@@ -47,6 +50,8 @@ class VA_Server:
         self.dtype = job_config.param_dtype
         self.device = torch.device(f"cuda:{job_config.local_rank}")
         self.enable_offload = getattr(job_config, 'enable_offload', True)  # offload vae & text_encoder to save vram
+        self.rng = torch.Generator(device=self.device)
+        self.rng.manual_seed(self.job_config.seed + self.job_config.rank)
 
         self.scheduler = FlowMatchScheduler(shift=self.job_config.snr_shift,
                                             sigma_min=0.0,
@@ -82,6 +87,8 @@ class VA_Server:
                          'transformer'),
             torch_dtype=self.dtype,
             torch_device=self.device,
+            num_layers=self.job_config.num_layers,
+            ignore_mismatched_sizes=self.job_config.ignore_mismatched_sizes,
         )
         shard_fn = shard_model
         self.transformer = _configure_model(model=self.transformer,
@@ -444,12 +451,18 @@ class VA_Server:
         if frame_st_id == 0:
             init_latent = self._encode_obs(obs)
             self.init_latent = init_latent
+            if DEBUG:
+                save_async(
+                    init_latent[:, :, 0:1].detach().to(dtype=torch.float32).cpu().clone(),
+                    os.path.join(self.exp_save_root, 'first_frame_latent.pt'),
+                )
 
         latents = torch.randn(1,
                               48,
                               frame_chunk_size,
                               self.latent_height,
                               self.latent_width,
+                              generator=self.rng,
                               device=self.device,
                               dtype=self.dtype)
         actions = torch.randn(1,
@@ -457,6 +470,7 @@ class VA_Server:
                               frame_chunk_size,
                               self.action_per_frame,
                               1,
+                              generator=self.rng,
                               device=self.device,
                               dtype=self.dtype)
 
@@ -497,6 +511,11 @@ class VA_Server:
                     latent_cond,
                     None,
                     frame_st_id=frame_st_id)
+                if DEBUG and frame_st_id == 0 and i == 0:
+                    save_async(
+                        input_dict['latent_res_lst']['text_emb'].detach().to(dtype=torch.float32).cpu().clone(),
+                        os.path.join(self.exp_save_root, 'text_emb.pt'),
+                    )
 
                 video_noise_pred = self.transformer(
                     self._repeat_input_for_cfg(input_dict['latent_res_lst']),
@@ -513,6 +532,11 @@ class VA_Server:
                         video_noise_pred = video_noise_pred[1:] + self.job_config.guidance_scale * (video_noise_pred[:1] - video_noise_pred[1:])
                     else:
                         video_noise_pred = video_noise_pred[:1]
+                    if DEBUG and frame_st_id == 0 and i == 0:
+                        save_async(
+                            video_noise_pred.detach().to(dtype=torch.float32).cpu().clone(),
+                            os.path.join(self.exp_save_root, 'video_noise_pred_step0.pt'),
+                        )
                     latents = self.scheduler.step(video_noise_pred,
                                                   t,
                                                   latents,
@@ -552,6 +576,11 @@ class VA_Server:
                         action_noise_pred = action_noise_pred[1:] + self.job_config.action_guidance_scale * (action_noise_pred[:1] - action_noise_pred[1:])
                     else:
                         action_noise_pred = action_noise_pred[:1]
+                    if DEBUG and frame_st_id == 0 and i == 0:
+                        save_async(
+                            action_noise_pred.detach().to(dtype=torch.float32).cpu().clone(),
+                            os.path.join(self.exp_save_root, 'action_noise_pred_step0.pt'),
+                        )
                     actions = self.action_scheduler.step(action_noise_pred,
                                                          t,
                                                          actions,
@@ -561,8 +590,15 @@ class VA_Server:
 
         actions[:, ~self.action_mask] *= 0
 
-        save_async(latents, os.path.join(self.exp_save_root, f'latents_{frame_st_id}.pt'))
-        save_async(actions, os.path.join(self.exp_save_root, f'actions_{frame_st_id}.pt'))
+        if DEBUG:
+            save_async(
+                latents.detach().to(dtype=torch.float32).cpu().clone(),
+                os.path.join(self.exp_save_root, f'latents_{frame_st_id}.pt'),
+            )
+            save_async(
+                actions.detach().to(dtype=torch.float32).cpu().clone(),
+                os.path.join(self.exp_save_root, f'actions_{frame_st_id}.pt'),
+            )
 
         actions = self.postprocess_action(actions)
         torch.cuda.empty_cache()
@@ -571,7 +607,8 @@ class VA_Server:
     def _compute_kv_cache(self, obs):
         ### optional async save obs for debug
         self.transformer.clear_pred_cache(self.cache_name)
-        save_async(obs['obs'], os.path.join(self.exp_save_root, f'obs_data_{self.frame_st_id}.pt'))
+        if DEBUG:
+            save_async(obs['obs'], os.path.join(self.exp_save_root, f'obs_data_{self.frame_st_id}.pt'))
         latent_model_input = self._encode_obs(obs)
         if self.frame_st_id == 0:
             latent_model_input = torch.cat(
@@ -682,6 +719,7 @@ def run(args):
     rank = int(os.getenv("RANK", 0))
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
+    set_global_determinism(config.seed + rank, config.enable_deterministic)
     init_distributed(world_size, local_rank, rank)
     config.rank = rank
     config.local_rank = local_rank
@@ -695,6 +733,21 @@ def run(args):
         run_async_server_mode(model, local_rank, config.host, port)
     else:
         raise ValueError(f"Unknown infer mode: {config.infer_mode}")
+
+
+def set_global_determinism(seed, enable_deterministic):
+    logger.info(f"Set global seed={seed}, deterministic={enable_deterministic}")
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    if enable_deterministic:
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.use_deterministic_algorithms(True, warn_only=True)
 
 def main():
     """
